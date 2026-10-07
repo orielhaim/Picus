@@ -2,9 +2,7 @@
 
 Sleep deprivation + boredom + a Raspberry Pi Pico collecting dust in a drawer + absolutely nothing better to do = whatever the hell this is
 
-Basically I made a tiny Raspberry Pi Pico pretend to be a USB drive with almost 8 exabytes of storage
-
-It doesn't actually store every combination of data in existence! By generating files mathematically based on the folders you navigate through. Somewhere in that ridiculous maze of folders is literally any file you could ever want
+It actually stores every combination of data in existence! By generating files mathematically based on the folders you navigate through. Somewhere in that ridiculous maze of folders is literally any file you could ever want
 
 It's all written in Rust because apparently I wasn't suffering enough
 
