@@ -4,7 +4,7 @@ use crate::mtp::{
 };
 
 pub const MAX_SLOTS: usize = 2048;
-pub const MAX_DEPTH: usize = babel::BUF;
+pub const MAX_DEPTH: usize = MAX_SLOTS;
 
 const TX: usize = 512;
 const RX: usize = 64;
@@ -16,6 +16,28 @@ const MANUFACTURER: &[u8] = b"p2r3";
 const MODEL: &[u8] = b"USB of Babel";
 const VERSION: &[u8] = b"1.0";
 const EXTENSIONS: &[u8] = b"microsoft.com: 1.0; ";
+
+const DATETIME_TAIL: [u8; 75] = {
+    let s = DATETIME;
+    let n = (s.len() + 1) as u8;
+    let mut t = [0u8; 75];
+    let mut w = 0usize;
+    let mut rep = 0;
+    while rep < 2 {
+        t[w] = n;
+        w += 1;
+        let mut i = 0;
+        while i < s.len() {
+            t[w] = s[i];
+            w += 2;
+            i += 1;
+        }
+        w += 2;
+        rep += 1;
+    }
+    t[w] = 0;
+    t
+};
 
 const OP_GET_DEVICE_INFO: u16 = 0x1001;
 const OP_OPEN_SESSION: u16 = 0x1002;
@@ -191,6 +213,55 @@ async fn send_data<T: Transport>(
     write_bytes(t, mps, &payload[first..]).await
 }
 
+async fn send_content<T: Transport>(
+    t: &mut T,
+    mps: usize,
+    code: u16,
+    txn: u32,
+    babel: &Babel,
+    len: usize,
+) -> Result<(), T::Error> {
+    let total = (12 + len) as u32;
+    let mut buf = [0u8; 64];
+    buf[0..4].copy_from_slice(&total.to_le_bytes());
+    buf[4..6].copy_from_slice(&CONTAINER_DATA.to_le_bytes());
+    buf[6..8].copy_from_slice(&code.to_le_bytes());
+    buf[8..12].copy_from_slice(&txn.to_le_bytes());
+    let first = mps
+        .saturating_sub(12)
+        .min(buf.len().saturating_sub(12))
+        .min(len);
+    let mut borrow = 0i32;
+    for (i, slot) in buf[12..12 + first].iter_mut().enumerate() {
+        let v = babel.byte(i) as i32 - 1 - borrow;
+        if v < 0 {
+            *slot = (v + 256) as u8;
+            borrow = 1;
+        } else {
+            *slot = v as u8;
+            borrow = 0;
+        }
+    }
+    t.write_packet(&buf[..12 + first]).await?;
+    let mut i = first;
+    while i < len {
+        let n = (len - i).min(mps);
+        for (k, slot) in buf[..n].iter_mut().enumerate() {
+            let v = babel.byte(i + k) as i32 - 1 - borrow;
+            if v < 0 {
+                *slot = (v + 256) as u8;
+                borrow = 1;
+            } else {
+                *slot = v as u8;
+                borrow = 0;
+            }
+        }
+        t.write_packet(&buf[..n]).await?;
+        i += n;
+    }
+    Ok(())
+}
+
 async fn send_response<T: Transport>(
     t: &mut T,
     mps: usize,
@@ -253,6 +324,8 @@ pub struct Responder {
     slot_count: usize,
     session_open: bool,
     session_id: u32,
+    cache_slot: u16,
+    cache_valid: bool,
     path: [u16; MAX_DEPTH],
     tx: [u8; TX],
     rx: [u8; RX],
@@ -275,6 +348,8 @@ impl Responder {
             slot_count: 1,
             session_open: false,
             session_id: 0,
+            cache_slot: 0,
+            cache_valid: false,
             path: [0; MAX_DEPTH],
             tx: [0; TX],
             rx: [0; RX],
@@ -289,10 +364,39 @@ impl Responder {
 
     fn reset_slots(&mut self) {
         self.slot_count = 1;
+        self.cache_valid = false;
         self.slots[0] = Slot {
             parent: u16::MAX,
             local: 0,
         };
+    }
+
+    fn ensure_value(&mut self, slot: u16) -> Result<(), u16> {
+        if self.cache_valid && self.cache_slot == slot {
+            return Ok(());
+        }
+        if self.cache_valid {
+            let s = self.slots[slot as usize];
+            if s.parent == self.cache_slot {
+                if self.babel.push(s.local).is_err() {
+                    self.cache_valid = false;
+                    return Err(RESP_STORE_FULL);
+                }
+                self.cache_slot = slot;
+                return Ok(());
+            }
+        }
+        let depth = match resolve_path(&self.slots, self.slot_count, slot, &mut self.path) {
+            Ok(d) => d,
+            Err(_) => return Err(RESP_INVALID_OBJECT_HANDLE),
+        };
+        if self.babel.load(&self.path[..depth]).is_err() {
+            self.cache_valid = false;
+            return Err(RESP_STORE_FULL);
+        }
+        self.cache_slot = slot;
+        self.cache_valid = true;
+        Ok(())
     }
 
     fn find_or_alloc(&mut self, parent: u16, local: u16) -> Option<u16> {
@@ -441,31 +545,10 @@ impl Responder {
                     return send_response(t, mps, code, txn, RESP_INVALID_OBJECT_HANDLE, &[]).await;
                 }
                 if l == babel::FILE_LOCAL {
-                    let depth = match resolve_path(
-                        &self.slots,
-                        self.slot_count,
-                        s as u16,
-                        &mut self.path,
-                    ) {
-                        Ok(d) => d,
-                        Err(_) => {
-                            return send_response(
-                                t,
-                                mps,
-                                code,
-                                txn,
-                                RESP_INVALID_OBJECT_HANDLE,
-                                &[],
-                            )
-                            .await;
-                        }
-                    };
-                    let size = match self.babel.file_size(&self.path[..depth]) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return send_response(t, mps, code, txn, RESP_STORE_FULL, &[]).await;
-                        }
-                    };
+                    if let Err(resp) = self.ensure_value(s as u16) {
+                        return send_response(t, mps, code, txn, resp, &[]).await;
+                    }
+                    let size = self.babel.size();
                     let len = self.build_object_info(babel::FILE_NAME, false, size);
                     send_data(t, mps, code, txn, &self.tx[..len]).await?;
                 } else {
@@ -482,28 +565,11 @@ impl Responder {
                 if l != babel::FILE_LOCAL || s >= self.slot_count as u32 {
                     return send_response(t, mps, code, txn, RESP_INVALID_OBJECT_HANDLE, &[]).await;
                 }
-                let depth =
-                    match resolve_path(&self.slots, self.slot_count, s as u16, &mut self.path) {
-                        Ok(d) => d,
-                        Err(_) => {
-                            return send_response(
-                                t,
-                                mps,
-                                code,
-                                txn,
-                                RESP_INVALID_OBJECT_HANDLE,
-                                &[],
-                            )
-                            .await;
-                        }
-                    };
-                let content = match self.babel.file_content(&self.path[..depth]) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return send_response(t, mps, code, txn, RESP_STORE_FULL, &[]).await;
-                    }
-                };
-                send_data(t, mps, code, txn, content).await?;
+                if let Err(resp) = self.ensure_value(s as u16) {
+                    return send_response(t, mps, code, txn, resp, &[]).await;
+                }
+                let len = self.babel.size();
+                send_content(t, mps, code, txn, &self.babel, len).await?;
                 send_response(t, mps, code, txn, RESP_OK, &[]).await
             }
             OP_GET_DEVICE_PROP_DESC => {
@@ -593,9 +659,8 @@ impl Responder {
         push_u32(&mut self.tx, &mut w, 0);
         push_u32(&mut self.tx, &mut w, 0);
         push_ustring(&mut self.tx, &mut w, name);
-        push_cstring(&mut self.tx, &mut w, DATETIME);
-        push_cstring(&mut self.tx, &mut w, DATETIME);
-        push_cstring(&mut self.tx, &mut w, b"");
+        self.tx[w..w + DATETIME_TAIL.len()].copy_from_slice(&DATETIME_TAIL);
+        w += DATETIME_TAIL.len();
         w
     }
 
@@ -852,7 +917,9 @@ mod tests {
     fn chunked_file_retrieval() {
         let locals: Vec<u16> = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let mut babel = Babel::new();
-        let expected = babel.file_content(&locals).unwrap().to_vec();
+        babel.load(&locals).unwrap();
+        let mut expected = vec![0u8; babel.size()];
+        babel.content_into(&mut expected).unwrap();
         assert!(expected.len() > 4);
         let mut input = Vec::new();
         for (i, h) in locals.iter().enumerate() {
@@ -956,5 +1023,339 @@ mod tests {
         assert_eq!(handle_of(1), 8192 + 1);
         assert_eq!(handle_of(2), 16384 + 1);
         assert_eq!(handle_of(3), 8192 + 1);
+    }
+
+    struct Discard {
+        input: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Transport for Discard {
+        type Error = ();
+        async fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
+            if self.pos >= self.input.len() {
+                return Err(());
+            }
+            let n = (self.input.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.input[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+        async fn write_packet(&mut self, _buf: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    fn feed(r: &mut Responder, cmd: Vec<u8>) {
+        let mut d = Discard { input: cmd, pos: 0 };
+        embassy_futures::block_on(async {
+            r.handle(&mut d, 64).await.unwrap();
+        });
+    }
+
+    fn expected_file(locals: &[u16]) -> (usize, Vec<u8>) {
+        let mut b = Babel::new();
+        b.load(locals).unwrap();
+        let size = b.size();
+        let mut out = vec![0u8; size];
+        b.content_into(&mut out).unwrap();
+        (size, out)
+    }
+
+    #[test]
+    fn deep_traversal() {
+        let d = 120usize;
+        let locals: Vec<u16> = (0..d).map(|i| ((i * 37) % 4900 + 1) as u16).collect();
+        let mut r = Responder::new();
+        r.reset();
+        for i in 0..d {
+            let handle = ((i as u32) << 13) | locals[i] as u32;
+            feed(
+                &mut r,
+                command(OP_GET_OBJECT_HANDLES, 1, &[STORAGE_ID, 0, handle]),
+            );
+            let slot = (i as u32) + 1;
+            let fh = (slot << 13) | babel::FILE_LOCAL;
+            let mut mock = Mock::new(vec![
+                command(OP_GET_OBJECT_INFO, 1, &[fh]),
+                command(OP_GET_OBJECT, 1, &[fh]),
+            ]);
+            embassy_futures::block_on(async {
+                while mock.pos < mock.input.len() {
+                    r.handle(&mut mock, 64).await.unwrap();
+                }
+            });
+            let cs = containers(&mock.output);
+            let (size, content) = expected_file(&locals[..=i]);
+            let info = cs
+                .iter()
+                .find(|c| c.0 == CONTAINER_DATA && c.1 == OP_GET_OBJECT_INFO)
+                .unwrap();
+            let got = u32::from_le_bytes([info.3[8], info.3[9], info.3[10], info.3[11]]);
+            assert_eq!(got as usize, size, "depth={}", i + 1);
+            let file = cs
+                .iter()
+                .find(|c| c.0 == CONTAINER_DATA && c.1 == OP_GET_OBJECT)
+                .unwrap();
+            assert_eq!(file.3, content, "depth={}", i + 1);
+        }
+        assert_eq!(r.slot_count, d + 1);
+    }
+
+    #[test]
+    fn full_slot_occupancy() {
+        let mut r = Responder::new();
+        r.reset();
+        for i in 1..MAX_SLOTS {
+            feed(
+                &mut r,
+                command(OP_GET_OBJECT_HANDLES, 1, &[STORAGE_ID, 0, i as u32]),
+            );
+        }
+        assert_eq!(r.slot_count, MAX_SLOTS);
+        let mut mock = Mock::new(vec![command(
+            OP_GET_OBJECT_HANDLES,
+            1,
+            &[STORAGE_ID, 0, MAX_SLOTS as u32],
+        )]);
+        embassy_futures::block_on(async {
+            r.handle(&mut mock, 64).await.unwrap();
+        });
+        let cs = containers(&mock.output);
+        assert_eq!(cs[0].1, RESP_DEVICE_BUSY);
+        assert_eq!(r.slot_count, MAX_SLOTS);
+    }
+
+    #[test]
+    fn cache_jump_correctness() {
+        let mut r = Responder::new();
+        r.reset();
+        let a = (1u32 << 13) | babel::FILE_LOCAL;
+        let b = (2u32 << 13) | babel::FILE_LOCAL;
+        let mut mock = Mock::new(vec![
+            command(OP_GET_OBJECT_HANDLES, 1, &[STORAGE_ID, 0, 1]),
+            command(OP_GET_OBJECT_HANDLES, 2, &[STORAGE_ID, 0, 2]),
+            command(OP_GET_OBJECT, 3, &[a]),
+            command(OP_GET_OBJECT, 4, &[b]),
+            command(OP_GET_OBJECT, 5, &[a]),
+        ]);
+        embassy_futures::block_on(async {
+            while mock.pos < mock.input.len() {
+                r.handle(&mut mock, 64).await.unwrap();
+            }
+        });
+        let cs = containers(&mock.output);
+        let files: Vec<&Vec<u8>> = cs
+            .iter()
+            .filter(|c| c.0 == CONTAINER_DATA && c.1 == OP_GET_OBJECT)
+            .map(|c| &c.3)
+            .collect();
+        let (_, e1) = expected_file(&[1]);
+        let (_, e2) = expected_file(&[2]);
+        assert_eq!(files.len(), 3);
+        assert_eq!(*files[0], e1);
+        assert_eq!(*files[1], e2);
+        assert_eq!(*files[2], e1);
+    }
+
+    #[test]
+    fn streaming_chunks() {
+        let d = 60usize;
+        let locals: Vec<u16> = (0..d).map(|i| ((i * 53) % 4900 + 1) as u16).collect();
+        let mut input = Vec::new();
+        for (i, h) in locals.iter().enumerate() {
+            let handle = ((i as u32) << 13) | *h as u32;
+            input.push(command(
+                OP_GET_OBJECT_HANDLES,
+                i as u32,
+                &[STORAGE_ID, 0, handle],
+            ));
+        }
+        let slot = locals.len() as u32;
+        let fh = (slot << 13) | babel::FILE_LOCAL;
+        input.push(command(OP_GET_OBJECT, 999, &[fh]));
+        let (_, expected) = expected_file(&locals);
+        for &mps in &[64usize, 16, 8] {
+            let cs = run_mps(input.clone(), mps);
+            let file = cs
+                .iter()
+                .rev()
+                .find(|c| c.0 == CONTAINER_DATA && c.1 == OP_GET_OBJECT)
+                .unwrap();
+            assert_eq!(file.3, expected, "mps={}", mps);
+        }
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::babel::bench::{path, run};
+    use std::hint::black_box;
+
+    struct Sink<'a> {
+        input: &'a [u8],
+        pos: usize,
+        bytes: usize,
+    }
+
+    impl Transport for Sink<'_> {
+        type Error = ();
+        async fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
+            if self.pos >= self.input.len() {
+                return Err(());
+            }
+            let n = (self.input.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.input[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+        async fn write_packet(&mut self, buf: &[u8]) -> Result<(), ()> {
+            self.bytes += buf.len();
+            Ok(())
+        }
+    }
+
+    fn cmd(code: u16, txn: u32, params: &[u32]) -> Vec<u8> {
+        let mut v = Vec::new();
+        let total = (12 + params.len() * 4) as u32;
+        v.extend_from_slice(&total.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&code.to_le_bytes());
+        v.extend_from_slice(&txn.to_le_bytes());
+        for p in params {
+            v.extend_from_slice(&p.to_le_bytes());
+        }
+        v
+    }
+
+    fn txn(r: &mut Responder, input: &[u8], mps: usize) -> usize {
+        let mut s = Sink {
+            input,
+            pos: 0,
+            bytes: 0,
+        };
+        embassy_futures::block_on(async {
+            r.handle(&mut s, mps).await.unwrap();
+        });
+        s.bytes
+    }
+
+    fn descent(r: &mut Responder, d: usize) -> usize {
+        let mut total = 0usize;
+        for i in 0..d {
+            let local = ((i * 37) % 4900 + 1) as u32;
+            let handle = ((i as u32) << 13) | local;
+            total += txn(
+                r,
+                &cmd(OP_GET_OBJECT_HANDLES, 1, &[STORAGE_ID, 0, handle]),
+                64,
+            );
+            let file_handle = (((i as u32) + 1) << 13) | babel::FILE_LOCAL;
+            total += txn(r, &cmd(OP_GET_OBJECT_INFO, 1, &[file_handle]), 64);
+        }
+        total
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_responder() {
+        for &occ in &[1usize, 64, 256, 1024, 2048] {
+            let mut r = Responder::new();
+            r.reset();
+            for i in 1..occ {
+                r.find_or_alloc((i / 4900) as u16, (i % 4900 + 1) as u16);
+            }
+            let iters: u32 = 300_000;
+            run(&format!("find_or_alloc first occ={}", occ), iters, || {
+                black_box(r.find_or_alloc(black_box(0), black_box(1)));
+            });
+            run(&format!("find_or_alloc last  occ={}", occ), iters, || {
+                let s = r.slots[r.slot_count - 1];
+                black_box(r.find_or_alloc(black_box(s.parent), black_box(s.local)));
+            });
+        }
+
+        for &d in &[1usize, 8, 32, 64, 128, 256, 512, 1024, 2048] {
+            let mut r = Responder::new();
+            r.reset();
+            for i in 1..d {
+                r.find_or_alloc((i - 1) as u16, ((i * 37) % 4900 + 1) as u16);
+            }
+            let slot = (d - 1) as u16;
+            let iters: u32 = if d > 512 { 30_000 } else { 500_000 };
+            run(&format!("resolve_path d={}", d), iters, || {
+                black_box(
+                    resolve_path(&r.slots, r.slot_count, black_box(slot), &mut r.path).unwrap(),
+                );
+            });
+        }
+
+        run("Responder::new+reset", 50_000, || {
+            let mut r = Responder::new();
+            r.reset();
+            black_box(r.slot_count);
+        });
+
+        let root_handles = cmd(OP_GET_OBJECT_HANDLES, 1, &[STORAGE_ID, 0, ROOT_PARENT]);
+        let child_handles = cmd(OP_GET_OBJECT_HANDLES, 1, &[STORAGE_ID, 0, 1]);
+        let dir_info = cmd(OP_GET_OBJECT_INFO, 1, &[1]);
+        let mut r = Responder::new();
+        r.reset();
+        run("txn GetObjectHandles(root)", 20_000, || {
+            black_box(txn(&mut r, &root_handles, 64));
+        });
+        run("txn GetObjectHandles(child)", 20_000, || {
+            black_box(txn(&mut r, &child_handles, 64));
+        });
+        run("txn GetObjectInfo(dir)", 200_000, || {
+            black_box(txn(&mut r, &dir_info, 64));
+        });
+
+        for &d in &[4usize, 16, 64, 256] {
+            let locals = path(d);
+            let mut r = Responder::new();
+            r.reset();
+            for (i, h) in locals.iter().enumerate() {
+                let handle = ((i as u32) << 13) | *h as u32;
+                txn(
+                    &mut r,
+                    &cmd(OP_GET_OBJECT_HANDLES, 1, &[STORAGE_ID, 0, handle]),
+                    64,
+                );
+            }
+            let slot = locals.len() as u32;
+            let file_handle = (slot << 13) | babel::FILE_LOCAL;
+            let info = cmd(OP_GET_OBJECT_INFO, 1, &[file_handle]);
+            let get = cmd(OP_GET_OBJECT, 1, &[file_handle]);
+            let iters: u32 = if d > 64 { 10_000 } else { 100_000 };
+            run(&format!("txn GetObjectInfo(file) d={}", d), iters, || {
+                black_box(txn(&mut r, &info, 64));
+            });
+            run(&format!("txn GetObject(file) d={}", d), iters, || {
+                black_box(txn(&mut r, &get, 64));
+            });
+            run(
+                &format!("txn GetObjectInfo(file) cold d={}", d),
+                iters,
+                || {
+                    r.cache_valid = false;
+                    black_box(txn(&mut r, &info, 64));
+                },
+            );
+            run(&format!("txn GetObject(file) cold d={}", d), iters, || {
+                r.cache_valid = false;
+                black_box(txn(&mut r, &get, 64));
+            });
+        }
+
+        for &d in &[8usize, 16, 32, 64, 128, 256] {
+            let iters: u32 = if d > 64 { 200 } else { 2000 };
+            run(&format!("full descent d={}", d), iters, || {
+                let mut r = Responder::new();
+                r.reset();
+                black_box(descent(&mut r, d));
+            });
+        }
     }
 }
