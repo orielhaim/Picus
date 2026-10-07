@@ -1,0 +1,7 @@
+
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+runner = "picotool load --update --verify --execute -t elf"
+rustflags = ["-C", "link-arg=--nmagic", "-C", "link-arg=-Tlink.x"]
